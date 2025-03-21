@@ -1,0 +1,124 @@
+/*!
+ * @file unihiker_k10_webcam.cpp
+ * @brief 这是一个网络摄像头的驱动的库
+ * @copyright   Copyright (c) 2025 DFRobot Co.Ltd (http://www.dfrobot.com)
+ * @license     The MIT License (MIT)
+ * @author [TangJie](jie.tang@dfrobot.com)
+ * @version  V1.0
+ * @date  2025-03-21 
+ * @url https://github.com/DFRobot/unihiker_k10_webcam
+ */
+#include "unihiker_k10_webcam.h"
+#include "app_httpd.hpp"
+#include "esp_http_server.h"
+
+extern QueueHandle_t xQueueCamer;
+static httpd_handle_t camera_httpd = NULL;
+static camera_fb_t *frame = NULL;
+
+esp_err_t stream_handler(httpd_req_t *req) {
+    esp_err_t res = ESP_OK;
+    
+    size_t _jpg_buf_len = 0;
+    uint8_t *_jpg_buf = NULL;
+    char part_buf[128];
+
+    res = httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+    if (res != ESP_OK) {
+        return res;
+    }
+
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+    while (true) {
+        // 从队列接收帧数据
+        if (xQueueReceive(xQueueCamer, &frame, portMAX_DELAY) != pdTRUE) {
+            DBG("continue");
+            continue;  // 如果接收失败，继续等待
+        }
+
+        // 转换帧为 JPEG
+        if (!frame2jpg(frame, 80, &_jpg_buf, &_jpg_buf_len)) {
+            DBG("JPEG compression failed");
+            esp_camera_fb_return(frame);
+            res = ESP_FAIL;
+            break;
+        }
+        // 释放帧数据
+        esp_camera_fb_return(frame);
+
+        size_t hlen = snprintf(part_buf, 128, "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n", _jpg_buf_len);
+
+        res = httpd_resp_send_chunk(req, part_buf, hlen);
+
+        // 发送 JPEG 数据
+        res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+        if (res != ESP_OK) break;
+
+        // 结束当前帧
+        res = httpd_resp_send_chunk(req, "\r\n", 2);
+        if (res != ESP_OK) break;
+
+        free(_jpg_buf);
+        if (res != ESP_OK) break;
+    }
+
+    return res;
+}
+
+esp_err_t index_handler(httpd_req_t *req) {
+    DBG("Handling index request...");
+    return stream_handler(req);
+}
+
+unihiker_k10_webcam::unihiker_k10_webcam(void)
+{
+
+}
+
+bool unihiker_k10_webcam::enableWebcam(void)
+{
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+     // 注册主页
+     httpd_uri_t index_uri = {
+        .uri = "/",
+        .method = HTTP_GET,
+        .handler = index_handler,
+        .user_ctx = NULL
+    };
+
+    //注册视频流
+    httpd_uri_t stream_uri = {
+        .uri = "/stream",
+        .method = HTTP_GET,
+        .handler = stream_handler,
+        .user_ctx = NULL
+    };
+
+    if (httpd_start(&camera_httpd, &config) == ESP_OK)
+    {
+        DBG("HTTP server started successfully");
+        httpd_register_uri_handler(camera_httpd, &index_uri);
+        httpd_register_uri_handler(camera_httpd, &stream_uri);
+    }else{
+        DBG("Failed to start HTTP server");
+        return false;
+    }
+    return true;
+}
+
+
+bool unihiker_k10_webcam::disableWebcam(void)
+{
+    if(camera_httpd){
+        httpd_stop(camera_httpd);  // 停止 HTTP 服务器
+        camera_httpd = NULL;
+        if(frame){
+            esp_camera_fb_return(frame);
+            frame =  NULL;
+        }
+        DBG("HTTP server stopped");
+        return true;
+    }
+    return false;
+}
