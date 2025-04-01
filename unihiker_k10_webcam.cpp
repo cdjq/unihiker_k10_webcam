@@ -15,7 +15,6 @@
 extern QueueHandle_t xQueueCamer;
 static httpd_handle_t camera_httpd = NULL;
 static camera_fb_t *frame = NULL;
-
 esp_err_t stream_handler(httpd_req_t *req) {
     esp_err_t res = ESP_OK;
     
@@ -44,8 +43,10 @@ esp_err_t stream_handler(httpd_req_t *req) {
             res = ESP_FAIL;
             break;
         }
+
         // 释放帧数据
         esp_camera_fb_return(frame);
+        
 
         size_t hlen = snprintf(part_buf, 128, "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n", _jpg_buf_len);
 
@@ -62,13 +63,84 @@ esp_err_t stream_handler(httpd_req_t *req) {
         free(_jpg_buf);
         if (res != ESP_OK) break;
     }
-
+    
     return res;
 }
 
+esp_err_t capture_handler(httpd_req_t *req) {
+    DBG("Capture handler triggered!");
+    esp_err_t res = ESP_OK;
+
+    
+    if (xQueueReceive(xQueueCamer, &frame, portMAX_DELAY) != pdTRUE) {
+        DBG("continue");
+        return httpd_resp_send_500(req);
+    }
+
+    size_t jpg_buf_len = 0;
+    uint8_t *jpg_buf = NULL;
+
+    // 转换为 JPEG 格式
+    if (!frame2jpg(frame, 80, &jpg_buf, &jpg_buf_len)) {
+        DBG("JPEG compression failed");
+        esp_camera_fb_return(frame);
+        return httpd_resp_send_500(req);
+    }
+
+    esp_camera_fb_return(frame);
+    
+
+    // 设置 HTTP 响应头
+    httpd_resp_set_type(req, "image/jpeg");
+    httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=capture.jpg");
+
+    // 发送图片数据
+    res = httpd_resp_send(req, (const char *)jpg_buf, jpg_buf_len);
+
+    free(jpg_buf);
+    return res;
+}
+
+const char index_html[] = R"rawliteral(
+    <!DOCTYPE html>
+    <html lang="zh">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>K10 摄像头</title>
+    </head>
+    <body>
+        <h1>K10 摄像头</h1>
+        <br>
+        <button id="captureBtn">拍照并下载</button>
+    
+        <script>
+            document.getElementById("captureBtn").addEventListener("click", () => {
+                fetch("/capture")
+                    .then(response => response.blob())
+                    .then(blob => {
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement("a");
+                    link.href = url;
+                    link.download = "esp32_snapshot.jpg"; // 强制指定文件名
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    URL.revokeObjectURL(url);
+                })
+                .catch(error => console.error("Error downloading image:", error));
+            });
+
+        </script>
+    </body>
+    </html>
+    )rawliteral";
+
 esp_err_t index_handler(httpd_req_t *req) {
     DBG("Handling index request...");
-    return stream_handler(req);
+    httpd_resp_set_type(req, "text/html");
+    return httpd_resp_send(req, index_html, HTTPD_RESP_USE_STRLEN);
 }
 
 unihiker_k10_webcam::unihiker_k10_webcam(void)
@@ -95,11 +167,20 @@ bool unihiker_k10_webcam::enableWebcam(void)
         .user_ctx = NULL
     };
 
+    // 注册单张图片捕获
+    httpd_uri_t capture_uri = {
+        .uri = "/capture",
+        .method = HTTP_GET,
+        .handler = capture_handler,
+        .user_ctx = NULL
+    };
+
     if (httpd_start(&camera_httpd, &config) == ESP_OK)
     {
         DBG("HTTP server started successfully");
         httpd_register_uri_handler(camera_httpd, &index_uri);
         httpd_register_uri_handler(camera_httpd, &stream_uri);
+        httpd_register_uri_handler(camera_httpd, &capture_uri);
     }else{
         DBG("Failed to start HTTP server");
         return false;
